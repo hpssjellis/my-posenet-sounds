@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseNet Legs Drums + Arms Notes v06</title>
+</head>
+<body>
+
+<p>Jeremy Ellis / webmcu-ai test v06: adds a small silent gap between drum beats on the legs, and
+gives natural notes a wider "hit zone" than sharps on the arms (like white vs black piano keys).</p>
+
+<p>
+LEGS - calf angle from vertical. Each 7 degree band = 5 degrees active (drum plays) + 2 degrees
+silent gap before the next drum's zone starts:<br>
+LEFT: 0-7 silence, then clap, boom, kick, openhat, snare (each with a gap before the next)<br>
+RIGHT: 0-7 silence, then snare, ride, tom, tink, hihat (each with a gap before the next)
+</p>
+
+<p>
+ARMS - fold across chest = silence, no other silence/gaps - every angle plays some note.
+Naturals get 20 degrees, sharps get 8 degrees (matches real piano white/black key proportions).
+Angle from vertical-up toward YOUR actual right. CONFIRMED: 0 degrees (straight up) = C, not A:<br>
+0-20=C, 20-28=Cs, 28-48=D, 48-56=Ds, 56-76=E, 76-96=F, 96-104=Fs, 104-124=G, 124-132=Gs,
+132-152=A, 152-160=As, 160-180=B,<br>
+180-200=C4, 200-208=Cs4, 208-228=D4, 228-236=Ds4, 236-256=E4, 256-276=F4, 276-284=Fs4,
+284-304=G4, 304-312=Gs4, 312-332=A4, 332-340=As4, 340-360=B4
+</p>
+
+<button id="startButton">Start Camera + Sound</button>
+<br><br>
+
+<video id="video" width="480" height="360" autoplay playsinline muted style="display:none"></video>
+<canvas id="canvas" width="480" height="360"></canvas>
+
+<p id="statusText">Not started</p>
+<p id="leftLegText">Left calf angle: -</p>
+<p id="rightLegText">Right calf angle: -</p>
+<p id="leftArmText">Left arm: -</p>
+<p id="rightArmText">Right arm: -</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script>
+
+<script>
+
+var myMinKeypointScore = 0.4;
+
+function myGetKeypoint(pose, name) {
+  for (var i = 0; i < pose.keypoints.length; i++) {
+    if (pose.keypoints[i].part === name) return pose.keypoints[i];
+  }
+  return null;
+}
+
+function myDrawSkeletonPoint(ctx, point) {
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, 5, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+// draws a text label right at a keypoint so you can see, live, what is sounding and where
+function myDrawLabelAtPoint(ctx, point, text) {
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, point.x + 8, point.y - 8);
+  ctx.fillStyle = "#000000";
+  ctx.fillText(text, point.x + 7, point.y - 9);
+}
+
+
+// =========================================================
+// LEGS - drum sounds
+// =========================================================
+
+var myLegActiveDegrees = 5; // width of the "hit zone" for each drum
+var myLegDeadDegrees = 2;   // silent gap between one drum's zone and the next
+var myLegBandWidth = myLegActiveDegrees + myLegDeadDegrees; // 7 total, same overall spacing as v05
+
+// returns 0 for silence (standing straight, OR in the dead gap between two drum zones),
+// or 1-5 for which drum zone is currently active. Band 5+ has no dead zone after it (open-ended).
+function myLegAngleToBand(angle) {
+  if (angle < myLegBandWidth) return 0; // initial standing-straight silence
+  var shifted = angle - myLegBandWidth;
+  var band = Math.floor(shifted / myLegBandWidth) + 1;
+  if (band >= 5) return 5;
+  var positionInBand = shifted % myLegBandWidth;
+  return positionInBand < myLegActiveDegrees ? band : 0; // 0 = in the dead gap
+}
+
+var myLeftLegSoundNames = ["clap", "boom", "kick", "openhat", "snare"];
+var myLeftLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/clap.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/boom.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/kick.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/openhat.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav"
+];
+
+var myRightLegSoundNames = ["snare", "ride", "tom", "tink", "hihat"];
+var myRightLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/ride.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tom.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tink.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/hihat.wav"
+];
+
+var myLeftLegAudio = [];
+var myRightLegAudio = [];
+
+function myPreloadLegSounds() {
+  for (var i = 0; i < myLeftLegSoundUrls.length; i++) {
+    var a = new Audio(myLeftLegSoundUrls[i]);
+    a.preload = "auto";
+    myLeftLegAudio.push(a);
+  }
+  for (var j = 0; j < myRightLegSoundUrls.length; j++) {
+    var b = new Audio(myRightLegSoundUrls[j]);
+    b.preload = "auto";
+    myRightLegAudio.push(b);
+  }
+}
+
+function myPlayLegSound(bandIndex, preloadedArray) {
+  var soundIndex = bandIndex - 1;
+  if (soundIndex >= preloadedArray.length) {
+    soundIndex = preloadedArray.length - 1;
+  }
+  var clip = preloadedArray[soundIndex].cloneNode();
+  clip.play();
+}
+
+function myCalfAngleFromVertical(knee, ankle) {
+  var dx = ankle.x - knee.x;
+  var dy = ankle.y - knee.y;
+  var radians = Math.atan2(dx, dy);
+  return Math.abs(radians * 180 / Math.PI);
+}
+
+function myProcessLeg(pose, kneeName, ankleName, sideLabel, lastBandHolder, preloadedArray, nameArray, ctx) {
+  var knee = myGetKeypoint(pose, kneeName);
+  var ankle = myGetKeypoint(pose, ankleName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftLegText" : "rightLegText");
+
+  if (!knee || !ankle || knee.score < myMinKeypointScore || ankle.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " calf angle: not visible";
+    return;
+  }
+
+  var angle = myCalfAngleFromVertical(knee.position, ankle.position);
+  var band = myLegAngleToBand(angle);
+
+  var drumLabel = "silent";
+  if (band > 0) {
+    var soundIndex = Math.min(band - 1, nameArray.length - 1);
+    drumLabel = nameArray[soundIndex];
+  }
+
+  textEl.textContent = sideLabel + " calf angle: " + angle.toFixed(1) + " deg  (band " + band + ", " + drumLabel + ")";
+
+  if (band > 0) {
+    myDrawLabelAtPoint(ctx, ankle.position, drumLabel);
+  }
+
+  if (band !== lastBandHolder.value) {
+    if (band > 0) {
+      myPlayLegSound(band, preloadedArray);
+    }
+    lastBandHolder.value = band;
+  }
+}
+
+var myLeftLegBandHolder = { value: 0 };
+var myRightLegBandHolder = { value: 0 };
+
+
+// =========================================================
+// ARMS - real note mp3s
+// =========================================================
+
+// CHANGE THIS if your media folder has a different relative path/name
+var myNoteMediaFolder = "media/";
+
+// myNoteNames[i] (the concept) maps directly to myNoteFileNames[i] (the actual mp3) and
+// myNoteDisplayNames[i] (the on-screen label). Index 0 = C, confirmed NOT A, as originally intended.
+// Mid octave uses your unlabeled files, High octave uses your "4" labeled files.
+var myNoteNames = [
+  "myMidC", "myMidCSharp", "myMidD", "myMidDSharp", "myMidE", "myMidF",
+  "myMidFSharp", "myMidG", "myMidGSharp", "myMidA", "myMidASharp", "myMidB",
+  "myHighC", "myHighCSharp", "myHighD", "myHighDSharp", "myHighE", "myHighF",
+  "myHighFSharp", "myHighG", "myHighGSharp", "myHighA", "myHighASharp", "myHighB"
+];
+
+var myNoteFileNames = [
+  "C.mp3", "Cs.mp3", "D.mp3", "Ds.mp3", "E.mp3", "F.mp3",
+  "Fs.mp3", "G.mp3", "Gs.mp3", "A.mp3", "As.mp3", "B.mp3",
+  "C4.mp3", "Cs4.mp3", "D4.mp3", "Ds4.mp3", "E4.mp3", "F4.mp3",
+  "Fs4.mp3", "G4.mp3", "Gs4.mp3", "A4.mp3", "As4.mp3", "B4.mp3"
+];
+
+var myNoteDisplayNames = [
+  "C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B",
+  "C4", "Cs4", "D4", "Ds4", "E4", "F4", "Fs4", "G4", "Gs4", "A4", "As4", "B4"
+];
+
+// Naturals get a wider "playing zone" than sharps, same as white vs black piano keys.
+// 7 naturals x 20 + 5 sharps x 8 = 180 degrees per octave (matches the old uniform 12 x 15 = 180 total).
+var myNoteWidthsDegrees = [
+  20, 8, 20, 8, 20, 20, 8, 20, 8, 20, 8, 20,   // mid octave: C Cs D Ds E F Fs G Gs A As B
+  20, 8, 20, 8, 20, 20, 8, 20, 8, 20, 8, 20    // high octave: same pattern
+];
+
+// precomputed cumulative start angle for each note, e.g. myNoteBoundaries[0]=0 (C starts at 0),
+// myNoteBoundaries[1]=20 (Cs starts at 20), etc. Built once at load time.
+var myNoteBoundaries = [];
+(function myBuildNoteBoundaries() {
+  var runningTotal = 0;
+  for (var i = 0; i < myNoteWidthsDegrees.length; i++) {
+    myNoteBoundaries.push(runningTotal);
+    runningTotal += myNoteWidthsDegrees[i];
+  }
+})();
+
+var myTotalNotes = myNoteNames.length; // 24
+
+// finds which note zone a given angle (0-360) falls into, using the variable widths above
+function myArmAngleToNoteIndex(angle) {
+  for (var i = myNoteBoundaries.length - 1; i >= 0; i--) {
+    if (angle >= myNoteBoundaries[i]) return i;
+  }
+  return 0;
+}
+var myStraightArmMinDegrees = 150;
+
+var myNoteAudio = [];
+
+function myPreloadNoteSounds() {
+  for (var i = 0; i < myTotalNotes; i++) {
+    var url = myNoteMediaFolder + myNoteFileNames[i];
+    var a = new Audio(url);
+    a.preload = "auto";
+    myNoteAudio.push(a);
+  }
+}
+
+function myPlayNote(noteIndex) {
+  var clip = myNoteAudio[noteIndex].cloneNode();
+  clip.play();
+}
+
+function myElbowStraightnessDegrees(shoulder, elbow, wrist) {
+  var v1x = shoulder.x - elbow.x;
+  var v1y = shoulder.y - elbow.y;
+  var v2x = wrist.x - elbow.x;
+  var v2y = wrist.y - elbow.y;
+
+  var dot = v1x * v2x + v1y * v2y;
+  var mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
+  var mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
+
+  if (mag1 === 0 || mag2 === 0) return 0;
+
+  var cosAngle = dot / (mag1 * mag2);
+  cosAngle = Math.max(-1, Math.min(1, cosAngle));
+  var radians = Math.acos(cosAngle);
+  return radians * 180 / Math.PI;
+}
+
+// angle of shoulder->wrist from straight-up, increasing toward the PERSON'S ACTUAL right
+// (video is not mirrored, so actual-right = smaller screen x)
+function myArmAngleFromVerticalTowardActualRight(shoulder, wrist) {
+  var dx = wrist.x - shoulder.x;
+  var dy = wrist.y - shoulder.y;
+  var radians = Math.atan2(-dx, -dy);
+  var degrees = radians * 180 / Math.PI;
+  if (degrees < 0) degrees += 360;
+  return degrees;
+}
+
+function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastNoteHolder, ctx) {
+  var shoulder = myGetKeypoint(pose, shoulderName);
+  var elbow = myGetKeypoint(pose, elbowName);
+  var wrist = myGetKeypoint(pose, wristName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftArmText" : "rightArmText");
+
+  if (!shoulder || !elbow || !wrist ||
+      shoulder.score < myMinKeypointScore ||
+      elbow.score < myMinKeypointScore ||
+      wrist.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " arm: not visible";
+    lastNoteHolder.value = -1;
+    return;
+  }
+
+  var straightness = myElbowStraightnessDegrees(shoulder.position, elbow.position, wrist.position);
+  var isOut = straightness >= myStraightArmMinDegrees;
+
+  if (!isOut) {
+    textEl.textContent = sideLabel + " arm: folded (elbow " + straightness.toFixed(0) + " deg) - silent";
+    lastNoteHolder.value = -1;
+    return;
+  }
+
+  var angle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
+  var noteIndex = myArmAngleToNoteIndex(angle);
+
+  textEl.textContent = sideLabel + " arm: " + angle.toFixed(1) + " deg  -> " + myNoteDisplayNames[noteIndex];
+
+  myDrawLabelAtPoint(ctx, wrist.position, myNoteDisplayNames[noteIndex]);
+
+  if (noteIndex !== lastNoteHolder.value) {
+    myPlayNote(noteIndex);
+    lastNoteHolder.value = noteIndex;
+  }
+}
+
+var myLeftArmNoteHolder = { value: -1 };
+var myRightArmNoteHolder = { value: -1 };
+
+
+// =========================================================
+// Shared camera + main loop
+// =========================================================
+
+async function mySetupCamera() {
+  var video = document.getElementById("video");
+  var stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 480, height: 360 },
+    audio: false
+  });
+  video.srcObject = stream;
+  return new Promise(function (resolve) {
+    video.onloadedmetadata = function () {
+      resolve(video);
+    };
+  });
+}
+
+async function myDetectLoop(video, net, canvas, ctx) {
+  var pose = await net.estimateSinglePose(video, { flipHorizontal: false });
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  for (var i = 0; i < pose.keypoints.length; i++) {
+    if (pose.keypoints[i].score > myMinKeypointScore) {
+      myDrawSkeletonPoint(ctx, pose.keypoints[i].position);
+    }
+  }
+
+  myProcessLeg(pose, "leftKnee", "leftAnkle", "left", myLeftLegBandHolder, myLeftLegAudio, myLeftLegSoundNames, ctx);
+  myProcessLeg(pose, "rightKnee", "rightAnkle", "right", myRightLegBandHolder, myRightLegAudio, myRightLegSoundNames, ctx);
+
+  myProcessArm(pose, "leftShoulder", "leftElbow", "leftWrist", "left", myLeftArmNoteHolder, ctx);
+  myProcessArm(pose, "rightShoulder", "rightElbow", "rightWrist", "right", myRightArmNoteHolder, ctx);
+
+  requestAnimationFrame(function () {
+    myDetectLoop(video, net, canvas, ctx);
+  });
+}
+
+async function myMain() {
+  document.getElementById("statusText").textContent = "Loading PoseNet model...";
+  myPreloadLegSounds();
+  myPreloadNoteSounds();
+
+  var video = await mySetupCamera();
+  video.play();
+
+  var net = await posenet.load();
+
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("2d");
+
+  document.getElementById("statusText").textContent = "Running. Legs = drums, arms = notes. Labels appear on screen at the moving limb.";
+
+  myDetectLoop(video, net, canvas, ctx);
+}
+
+document.getElementById("startButton").addEventListener("click", function () {
+  document.getElementById("startButton").disabled = true;
+  myMain();
+});
+
+</script>
+</body>
+</html>
