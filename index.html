@@ -2,25 +2,28 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>PoseNet Legs Drums + Arms Notes v05</title>
+<title>PoseNet Legs Drums + Arms Notes v06</title>
 </head>
 <body>
 
-<p>Jeremy Ellis / webmcu-ai test v05: legs play drum sounds, arms play real note mp3s. v05 adds on-screen
-labels at the exact limb position so you can see what is playing, and narrows the leg bands to 7 degrees
-(from 15) so all 5 drum sounds per leg are reachable.</p>
+<p>Jeremy Ellis / webmcu-ai test v06: adds a small silent gap between drum beats on the legs, and
+gives natural notes a wider "hit zone" than sharps on the arms (like white vs black piano keys).</p>
 
 <p>
-LEGS - calf angle from vertical, 7 degrees per band:<br>
-LEFT: 0-7 silence, 7-14 clap, 14-21 boom, 21-28 kick, 28-35 openhat, 35+ snare<br>
-RIGHT: 0-7 silence, 7-14 snare, 14-21 ride, 21-28 tom, 28-35 tink, 35+ hihat
+LEGS - calf angle from vertical. Each 7 degree band = 5 degrees active (drum plays) + 2 degrees
+silent gap before the next drum's zone starts:<br>
+LEFT: 0-7 silence, then clap, boom, kick, openhat, snare (each with a gap before the next)<br>
+RIGHT: 0-7 silence, then snare, ride, tom, tink, hihat (each with a gap before the next)
 </p>
 
 <p>
-ARMS - fold across chest = silence. Extend arm straight, angle from vertical-up toward YOUR actual right,
-15 degrees per note, same mapping for both arms. CONFIRMED: 0 degrees (straight up) = C, not A:<br>
-0=C, 15=Cs, 30=D, 45=Ds, 60=E, 75=F, 90=Fs, 105=G, 120=Gs, 135=A, 150=As, 165=B,<br>
-180=C4, 195=Cs4, 210=D4, 225=Ds4, 240=E4, 255=F4, 270=Fs4, 285=G4, 300=Gs4, 315=A4, 330=As4, 345=B4
+ARMS - fold across chest = silence, no other silence/gaps - every angle plays some note.
+Naturals get 20 degrees, sharps get 8 degrees (matches real piano white/black key proportions).
+Angle from vertical-up toward YOUR actual right. CONFIRMED: 0 degrees (straight up) = C, not A:<br>
+0-20=C, 20-28=Cs, 28-48=D, 48-56=Ds, 56-76=E, 76-96=F, 96-104=Fs, 104-124=G, 124-132=Gs,
+132-152=A, 152-160=As, 160-180=B,<br>
+180-200=C4, 200-208=Cs4, 208-228=D4, 228-236=Ds4, 236-256=E4, 256-276=F4, 276-284=Fs4,
+284-304=G4, 304-312=Gs4, 312-332=A4, 332-340=As4, 340-360=B4
 </p>
 
 <button id="startButton">Start Camera + Sound</button>
@@ -69,7 +72,20 @@ function myDrawLabelAtPoint(ctx, point, text) {
 // LEGS - drum sounds
 // =========================================================
 
-var myDegreesPerLegBand = 7; // was 15 - narrowed so all 5 drums per leg are reachable
+var myLegActiveDegrees = 5; // width of the "hit zone" for each drum
+var myLegDeadDegrees = 2;   // silent gap between one drum's zone and the next
+var myLegBandWidth = myLegActiveDegrees + myLegDeadDegrees; // 7 total, same overall spacing as v05
+
+// returns 0 for silence (standing straight, OR in the dead gap between two drum zones),
+// or 1-5 for which drum zone is currently active. Band 5+ has no dead zone after it (open-ended).
+function myLegAngleToBand(angle) {
+  if (angle < myLegBandWidth) return 0; // initial standing-straight silence
+  var shifted = angle - myLegBandWidth;
+  var band = Math.floor(shifted / myLegBandWidth) + 1;
+  if (band >= 5) return 5;
+  var positionInBand = shifted % myLegBandWidth;
+  return positionInBand < myLegActiveDegrees ? band : 0; // 0 = in the dead gap
+}
 
 var myLeftLegSoundNames = ["clap", "boom", "kick", "openhat", "snare"];
 var myLeftLegSoundUrls = [
@@ -132,7 +148,7 @@ function myProcessLeg(pose, kneeName, ankleName, sideLabel, lastBandHolder, prel
   }
 
   var angle = myCalfAngleFromVertical(knee.position, ankle.position);
-  var band = Math.floor(angle / myDegreesPerLegBand);
+  var band = myLegAngleToBand(angle);
 
   var drumLabel = "silent";
   if (band > 0) {
@@ -187,8 +203,33 @@ var myNoteDisplayNames = [
   "C4", "Cs4", "D4", "Ds4", "E4", "F4", "Fs4", "G4", "Gs4", "A4", "As4", "B4"
 ];
 
-var myDegreesPerNote = 15;
+// Naturals get a wider "playing zone" than sharps, same as white vs black piano keys.
+// 7 naturals x 20 + 5 sharps x 8 = 180 degrees per octave (matches the old uniform 12 x 15 = 180 total).
+var myNoteWidthsDegrees = [
+  20, 8, 20, 8, 20, 20, 8, 20, 8, 20, 8, 20,   // mid octave: C Cs D Ds E F Fs G Gs A As B
+  20, 8, 20, 8, 20, 20, 8, 20, 8, 20, 8, 20    // high octave: same pattern
+];
+
+// precomputed cumulative start angle for each note, e.g. myNoteBoundaries[0]=0 (C starts at 0),
+// myNoteBoundaries[1]=20 (Cs starts at 20), etc. Built once at load time.
+var myNoteBoundaries = [];
+(function myBuildNoteBoundaries() {
+  var runningTotal = 0;
+  for (var i = 0; i < myNoteWidthsDegrees.length; i++) {
+    myNoteBoundaries.push(runningTotal);
+    runningTotal += myNoteWidthsDegrees[i];
+  }
+})();
+
 var myTotalNotes = myNoteNames.length; // 24
+
+// finds which note zone a given angle (0-360) falls into, using the variable widths above
+function myArmAngleToNoteIndex(angle) {
+  for (var i = myNoteBoundaries.length - 1; i >= 0; i--) {
+    if (angle >= myNoteBoundaries[i]) return i;
+  }
+  return 0;
+}
 var myStraightArmMinDegrees = 150;
 
 var myNoteAudio = [];
@@ -261,8 +302,7 @@ function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastN
   }
 
   var angle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
-  var noteIndex = Math.floor(angle / myDegreesPerNote);
-  if (noteIndex >= myTotalNotes) noteIndex = myTotalNotes - 1;
+  var noteIndex = myArmAngleToNoteIndex(angle);
 
   textEl.textContent = sideLabel + " arm: " + angle.toFixed(1) + " deg  -> " + myNoteDisplayNames[noteIndex];
 
