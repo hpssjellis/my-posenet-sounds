@@ -2,14 +2,27 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>PoseNet Legs Drums + Arms Notes v08</title>
+<title>PoseNet Legs Drums + Arms Notes v09</title>
 </head>
 <body>
 
-<p>Jeremy Ellis / webmcu-ai test v08: arm notes now sustain longer the farther the hand reaches from
-the shoulder (relative to your own arm length, so it self-calibrates to any body size). Duration is
-decided at the moment a note starts, based on how extended the arm is right then - it does not keep
-changing while a note is already ringing. Legs are unchanged (drum hits stay full length).</p>
+<p>Jeremy Ellis / webmcu-ai test v09: sounds now fire on a steady tempo clock instead of the instant
+a position changes. Your body position still decides WHAT plays (fully continuous, unchanged), but
+WHEN it plays is now locked to the beat below. Legs replay their current drum every tick while held
+in a zone (like a drum machine). Arms only re-trigger on a tick if the note actually changed since
+the last tick (so a held note doesn't machine-gun-repeat). Angle readings are also lightly smoothed
+now, which should reduce one leg falsely triggering from the other leg's movement.</p>
+
+<label for="bpmInput">Tempo (BPM): </label>
+<input type="number" id="bpmInput" value="120" min="40" max="240" step="1">
+&nbsp;&nbsp;
+<label for="subdivisionSelect">Beat subdivision: </label>
+<select id="subdivisionSelect">
+  <option value="1">Quarter notes (1 per beat)</option>
+  <option value="2" selected>Eighth notes (2 per beat)</option>
+  <option value="4">Sixteenth notes (4 per beat)</option>
+</select>
+<br><br>
 
 <label for="keySelect">Arm note key/scale: </label>
 <select id="keySelect">
@@ -59,13 +72,25 @@ notes are available and how much angular room each one gets - it does NOT move w
 
 <script>
 
-var myMinKeypointScore = 0.4;
+var myMinKeypointScore = 0.5; // was 0.4 - slightly stricter, rejects more low-confidence noisy detections
 
 function myGetKeypoint(pose, name) {
   for (var i = 0; i < pose.keypoints.length; i++) {
     if (pose.keypoints[i].part === name) return pose.keypoints[i];
   }
   return null;
+}
+
+// simple exponential moving average, smooths frame-to-frame jitter in an angle reading.
+// holder is a {value: null} object that persists between calls for one specific limb.
+var myAngleSmoothingAlpha = 0.35; // lower = smoother/slower, higher = snappier/less smoothing
+function mySmoothAngle(holder, rawAngle) {
+  if (holder.value === null) {
+    holder.value = rawAngle;
+  } else {
+    holder.value = myAngleSmoothingAlpha * rawAngle + (1 - myAngleSmoothingAlpha) * holder.value;
+  }
+  return holder.value;
 }
 
 // draws a LARGE text label right at a keypoint so it's easy to read from a normal viewing distance
@@ -145,17 +170,20 @@ function myCalfAngleFromVertical(knee, ankle) {
   return Math.abs(radians * 180 / Math.PI);
 }
 
-function myProcessLeg(pose, kneeName, ankleName, sideLabel, lastBandHolder, preloadedArray, nameArray, ctx) {
+function myProcessLeg(pose, kneeName, ankleName, sideLabel, currentBandHolder, smoothedAngleHolder, nameArray, ctx) {
   var knee = myGetKeypoint(pose, kneeName);
   var ankle = myGetKeypoint(pose, ankleName);
   var textEl = document.getElementById(sideLabel === "left" ? "leftLegText" : "rightLegText");
 
   if (!knee || !ankle || knee.score < myMinKeypointScore || ankle.score < myMinKeypointScore) {
     textEl.textContent = sideLabel + " calf angle: not visible";
+    currentBandHolder.value = 0;
+    smoothedAngleHolder.value = null; // reset smoothing so it doesn't jump when it reappears
     return;
   }
 
-  var angle = myCalfAngleFromVertical(knee.position, ankle.position);
+  var rawAngle = myCalfAngleFromVertical(knee.position, ankle.position);
+  var angle = mySmoothAngle(smoothedAngleHolder, rawAngle);
   var band = myLegAngleToBand(angle);
 
   var drumLabel = "silent";
@@ -170,16 +198,13 @@ function myProcessLeg(pose, kneeName, ankleName, sideLabel, lastBandHolder, prel
     myDrawLabelAtPoint(ctx, ankle.position, drumLabel);
   }
 
-  if (band !== lastBandHolder.value) {
-    if (band > 0) {
-      myPlayLegSound(band, preloadedArray);
-    }
-    lastBandHolder.value = band;
-  }
+  currentBandHolder.value = band; // the clock tick reads this - no direct playback here anymore
 }
 
-var myLeftLegBandHolder = { value: 0 };
-var myRightLegBandHolder = { value: 0 };
+var myLeftLegCurrentBand = { value: 0 };
+var myRightLegCurrentBand = { value: 0 };
+var myLeftLegSmoothedAngle = { value: null };
+var myRightLegSmoothedAngle = { value: null };
 
 
 // =========================================================
@@ -405,7 +430,7 @@ function myArmAngleFromVerticalTowardActualRight(shoulder, wrist) {
   return degrees;
 }
 
-function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastNoteHolder, ctx) {
+function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, currentNoteHolder, currentDurationHolder, smoothedAngleHolder, ctx) {
   var shoulder = myGetKeypoint(pose, shoulderName);
   var elbow = myGetKeypoint(pose, elbowName);
   var wrist = myGetKeypoint(pose, wristName);
@@ -416,7 +441,8 @@ function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastN
       elbow.score < myMinKeypointScore ||
       wrist.score < myMinKeypointScore) {
     textEl.textContent = sideLabel + " arm: not visible";
-    lastNoteHolder.value = -1;
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
     return;
   }
 
@@ -425,11 +451,13 @@ function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastN
 
   if (!isOut) {
     textEl.textContent = sideLabel + " arm: folded (elbow " + straightness.toFixed(0) + " deg) - silent";
-    lastNoteHolder.value = -1;
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
     return;
   }
 
-  var angle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
+  var rawAngle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
+  var angle = mySmoothAngle(smoothedAngleHolder, rawAngle);
   var noteIndex = myArmAngleToNoteIndex(angle);
   var reachRatio = myComputeReachRatio(shoulder.position, elbow.position, wrist.position);
   var durationMs = myReachRatioToDurationMs(reachRatio);
@@ -439,14 +467,69 @@ function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, lastN
 
   myDrawLabelAtPoint(ctx, wrist.position, myNoteDisplayNames[noteIndex]);
 
-  if (noteIndex !== lastNoteHolder.value) {
-    myPlayNote(noteIndex, durationMs);
-    lastNoteHolder.value = noteIndex;
-  }
+  currentNoteHolder.value = noteIndex;       // the clock tick reads these - no direct playback here anymore
+  currentDurationHolder.value = durationMs;
 }
 
-var myLeftArmNoteHolder = { value: -1 };
-var myRightArmNoteHolder = { value: -1 };
+var myLeftArmCurrentNote = { value: -1 };
+var myRightArmCurrentNote = { value: -1 };
+var myLeftArmCurrentDuration = { value: 0 };
+var myRightArmCurrentDuration = { value: 0 };
+var myLeftArmSmoothedAngle = { value: null };
+var myRightArmSmoothedAngle = { value: null };
+var myLeftArmLastTickNote = -1;  // what was actually PLAYED on the previous tick (for change detection)
+var myRightArmLastTickNote = -1;
+
+
+// =========================================================
+// TEMPO CLOCK - decouples WHAT plays (continuous body position, every video frame)
+// from WHEN it plays (fixed musical grid, independent of video framerate)
+// =========================================================
+
+var myClockIntervalHandle = null;
+
+function myComputeTickIntervalMs() {
+  var bpm = parseFloat(document.getElementById("bpmInput").value) || 120;
+  var subdivision = parseFloat(document.getElementById("subdivisionSelect").value) || 2;
+  var beatMs = 60000 / bpm;
+  return beatMs / subdivision;
+}
+
+function myOnClockTick() {
+  // LEGS: replay the currently-held drum every tick, like a drum machine locked to the beat
+  if (myLeftLegCurrentBand.value > 0) {
+    myPlayLegSound(myLeftLegCurrentBand.value, myLeftLegAudio);
+  }
+  if (myRightLegCurrentBand.value > 0) {
+    myPlayLegSound(myRightLegCurrentBand.value, myRightLegAudio);
+  }
+
+  // ARMS: only re-trigger if the note actually changed since the last tick,
+  // so a held note doesn't machine-gun-repeat every subdivision
+  if (myLeftArmCurrentNote.value >= 0 && myLeftArmCurrentNote.value !== myLeftArmLastTickNote) {
+    myPlayNote(myLeftArmCurrentNote.value, myLeftArmCurrentDuration.value);
+  }
+  myLeftArmLastTickNote = myLeftArmCurrentNote.value;
+
+  if (myRightArmCurrentNote.value >= 0 && myRightArmCurrentNote.value !== myRightArmLastTickNote) {
+    myPlayNote(myRightArmCurrentNote.value, myRightArmCurrentDuration.value);
+  }
+  myRightArmLastTickNote = myRightArmCurrentNote.value;
+}
+
+function myRestartClock() {
+  if (myClockIntervalHandle !== null) {
+    clearInterval(myClockIntervalHandle);
+  }
+  myClockIntervalHandle = setInterval(myOnClockTick, myComputeTickIntervalMs());
+}
+
+document.getElementById("bpmInput").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock(); // only live-update if already running
+});
+document.getElementById("subdivisionSelect").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock();
+});
 
 
 // =========================================================
@@ -474,11 +557,11 @@ async function myDetectLoop(video, net, canvas, ctx) {
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   // skeleton dots removed - the note/drum labels are the useful visual now
 
-  myProcessLeg(pose, "leftKnee", "leftAnkle", "left", myLeftLegBandHolder, myLeftLegAudio, myLeftLegSoundNames, ctx);
-  myProcessLeg(pose, "rightKnee", "rightAnkle", "right", myRightLegBandHolder, myRightLegAudio, myRightLegSoundNames, ctx);
+  myProcessLeg(pose, "leftKnee", "leftAnkle", "left", myLeftLegCurrentBand, myLeftLegSmoothedAngle, myLeftLegSoundNames, ctx);
+  myProcessLeg(pose, "rightKnee", "rightAnkle", "right", myRightLegCurrentBand, myRightLegSmoothedAngle, myRightLegSoundNames, ctx);
 
-  myProcessArm(pose, "leftShoulder", "leftElbow", "leftWrist", "left", myLeftArmNoteHolder, ctx);
-  myProcessArm(pose, "rightShoulder", "rightElbow", "rightWrist", "right", myRightArmNoteHolder, ctx);
+  myProcessArm(pose, "leftShoulder", "leftElbow", "leftWrist", "left", myLeftArmCurrentNote, myLeftArmCurrentDuration, myLeftArmSmoothedAngle, ctx);
+  myProcessArm(pose, "rightShoulder", "rightElbow", "rightWrist", "right", myRightArmCurrentNote, myRightArmCurrentDuration, myRightArmSmoothedAngle, ctx);
 
   requestAnimationFrame(function () {
     myDetectLoop(video, net, canvas, ctx);
@@ -498,8 +581,9 @@ async function myMain() {
   var canvas = document.getElementById("canvas");
   var ctx = canvas.getContext("2d");
 
-  document.getElementById("statusText").textContent = "Running. Legs = drums, arms = notes.";
+  document.getElementById("statusText").textContent = "Running. Legs = drums, arms = notes, tempo clock is live.";
 
+  myRestartClock();
   myDetectLoop(video, net, canvas, ctx);
 }
 
