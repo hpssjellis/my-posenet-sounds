@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseNet Full Body Drums + Notes v10</title>
+</head>
+<body>
+
+<p>Jeremy Ellis / webmcu-ai test v10: legs, head, and a jump now trigger drums as MOTION EVENTS
+(a fast movement that suddenly decelerates - like a real drumstick hit or a footstep) instead of
+holding a position. Arms are unchanged - they still use continuous position, since hands are
+naturally good at fine selection the way feet/head are not. This mirrors how a real drummer's
+limbs divide labor: small easy motions map to sounds that are used often, big effortful motions
+map to sounds that should be rare.</p>
+
+<p>
+Sound assignment (based on which real drum sounds get used most in a typical groove):<br>
+LEFT leg (small/medium/large swing at the moment of impact) = hihat / kick / tom<br>
+RIGHT leg (small/medium/large swing at the moment of impact) = tink / ride / openhat<br>
+HEAD (nod down-then-up = the hit, sideways tilt at that moment picks which) = snare (tilt one way) / clap (tilt other way)<br>
+JUMP (land after leaving the ground) = boom<br>
+ARMS (unchanged) = continuous notes from the key/scale dropdown below
+</p>
+
+<label for="sensitivityInput">Motion sensitivity: </label>
+<input type="number" id="sensitivityInput" value="1.0" min="0.3" max="3" step="0.1">
+(higher = easier to trigger with smaller/slower motions)
+&nbsp;&nbsp;
+<label><input type="checkbox" id="snapToGridCheckbox"> Snap hits to the beat grid (quantize timing)</label>
+<br><br>
+
+<label for="bpmInput">Tempo (BPM): </label>
+<input type="number" id="bpmInput" value="120" min="40" max="240" step="1">
+&nbsp;&nbsp;
+<label for="subdivisionSelect">Beat subdivision: </label>
+<select id="subdivisionSelect">
+  <option value="1">Quarter notes (1 per beat)</option>
+  <option value="2" selected>Eighth notes (2 per beat)</option>
+  <option value="4">Sixteenth notes (4 per beat)</option>
+</select>
+<br><br>
+
+<label for="keySelect">Arm note key/scale: </label>
+<select id="keySelect">
+  <option value="0" selected>C Major</option>
+  <option value="1">C# Major</option>
+  <option value="2">D Major</option>
+  <option value="3">D# Major</option>
+  <option value="4">E Major</option>
+  <option value="5">F Major</option>
+  <option value="6">F# Major</option>
+  <option value="7">G Major</option>
+  <option value="8">G# Major</option>
+  <option value="9">A Major</option>
+  <option value="10">A# Major</option>
+  <option value="11">B Major</option>
+  <option value="12">Chromatic (all 12 notes)</option>
+</select>
+
+<p>
+ARMS - fold across chest = silence, no other silence/gaps once extended - every angle plays some
+note. 0 degrees (straight up) is always the physical note C. The dropdown above only changes which
+notes are available and how much angular room each one gets - it does NOT move where C sits.
+</p>
+<p id="keyInfoText">(key zone info will appear here once loaded)</p>
+
+<button id="startButton">Start Camera + Sound</button>
+<br><br>
+
+<video id="video" width="480" height="360" autoplay playsinline muted style="display:none"></video>
+<canvas id="canvas" width="480" height="360"></canvas>
+
+<p id="statusText">Not started</p>
+<p id="leftLegText">Left leg: -</p>
+<p id="rightLegText">Right leg: -</p>
+<p id="headText">Head: -</p>
+<p id="jumpText">Jump: -</p>
+<p id="leftArmText">Left arm: -</p>
+<p id="rightArmText">Right arm: -</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script>
+
+<script>
+
+var myMinKeypointScore = 0.5;
+
+function myGetKeypoint(pose, name) {
+  for (var i = 0; i < pose.keypoints.length; i++) {
+    if (pose.keypoints[i].part === name) return pose.keypoints[i];
+  }
+  return null;
+}
+
+// simple exponential moving average - smooths frame-to-frame jitter in any scalar reading
+// (an angle in degrees, or a raw pixel position). holder is a {value: null} object that
+// persists between calls for one specific limb/reading.
+var mySmoothingAlpha = 0.35; // lower = smoother/slower, higher = snappier/less smoothing
+function myExponentialSmooth(holder, rawValue) {
+  if (holder.value === null) {
+    holder.value = rawValue;
+  } else {
+    holder.value = mySmoothingAlpha * rawValue + (1 - mySmoothingAlpha) * holder.value;
+  }
+  return holder.value;
+}
+
+// draws a LARGE text label right at a keypoint so it's easy to read from a normal viewing distance
+function myDrawLabelAtPoint(ctx, point, text) {
+  ctx.font = "bold 28px sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, point.x + 10, point.y - 10);
+  ctx.fillStyle = "#000000";
+  ctx.fillText(text, point.x + 8, point.y - 12);
+}
+
+function myGetSensitivityMultiplier() {
+  var raw = parseFloat(document.getElementById("sensitivityInput").value);
+  return (!isNaN(raw) && raw > 0) ? raw : 1.0;
+}
+
+
+// =========================================================
+// GENERIC MOTION-ATTACK ("IMPACT") DETECTOR
+// Fires true on the exact frame where a value was moving fast and then sharply decelerated -
+// the digital equivalent of a drumstick striking, or a foot landing. Reused for legs, head, jump.
+// =========================================================
+
+function myCreateImpactState() {
+  return { lastValue: null, lastVelocity: 0, lastTimestamp: null, lastTriggerTimestamp: 0 };
+}
+
+function myDetectImpact(state, currentValue, nowMs, velocityThreshold, refractoryMs) {
+  var isImpact = false;
+  if (state.lastValue !== null && state.lastTimestamp !== null) {
+    var dt = nowMs - state.lastTimestamp;
+    if (dt > 0) {
+      var velocity = (currentValue - state.lastValue) / dt; // units per millisecond
+      var wasMovingFast = Math.abs(state.lastVelocity) >= velocityThreshold;
+      var nowSlow = Math.abs(velocity) < velocityThreshold * 0.4;
+      var refractoryOk = (nowMs - state.lastTriggerTimestamp) >= refractoryMs;
+      if (wasMovingFast && nowSlow && refractoryOk) {
+        isImpact = true;
+        state.lastTriggerTimestamp = nowMs;
+      }
+      state.lastVelocity = velocity;
+    }
+  }
+  state.lastValue = currentValue;
+  state.lastTimestamp = nowMs;
+  return isImpact;
+}
+
+// plays an impact-triggered sound immediately, OR queues it for the next tempo tick if the
+// "snap to grid" checkbox is on - this is the live, audible demonstration of quantization
+var myPendingImpactSounds = [];
+function myTriggerImpactSound(audioEl) {
+  if (document.getElementById("snapToGridCheckbox").checked) {
+    myPendingImpactSounds.push(audioEl);
+  } else {
+    var clip = audioEl.cloneNode();
+    clip.play();
+  }
+}
+
+
+// =========================================================
+// LEGS - each leg is now a 3-sound impact instrument (small/medium/large swing at hit time),
+// matching how feet actually move: timing + a coarse choice, not fine continuous selection.
+// =========================================================
+
+var myLegImpactBaseThreshold = 0.06; // degrees per ms - starting point, tune with the sensitivity control
+var myLegRefractoryMs = 200;
+
+// zone boundaries in degrees, checked at the MOMENT of impact
+function myLegAngleToZoneIndex(angle) {
+  if (angle < 15) return 0;
+  if (angle < 35) return 1;
+  return 2;
+}
+
+var myLeftLegSoundNames = ["hihat", "kick", "tom"];
+var myLeftLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/hihat.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/kick.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tom.wav"
+];
+
+var myRightLegSoundNames = ["tink", "ride", "openhat"];
+var myRightLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tink.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/ride.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/openhat.wav"
+];
+
+var myLeftLegAudio = [];
+var myRightLegAudio = [];
+
+function myCalfAngleFromVertical(knee, ankle) {
+  var dx = ankle.x - knee.x;
+  var dy = ankle.y - knee.y;
+  var radians = Math.atan2(dx, dy);
+  return Math.abs(radians * 180 / Math.PI);
+}
+
+var myLeftLegImpactState = myCreateImpactState();
+var myRightLegImpactState = myCreateImpactState();
+var myLeftLegSmoothedAngle = { value: null };
+var myRightLegSmoothedAngle = { value: null };
+
+function myProcessLeg(pose, kneeName, ankleName, sideLabel, impactState, smoothedAngleHolder, soundNames, soundAudio, nowMs, ctx) {
+  var knee = myGetKeypoint(pose, kneeName);
+  var ankle = myGetKeypoint(pose, ankleName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftLegText" : "rightLegText");
+
+  if (!knee || !ankle || knee.score < myMinKeypointScore || ankle.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " leg: not visible";
+    smoothedAngleHolder.value = null;
+    impactState.lastValue = null;
+    impactState.lastTimestamp = null;
+    return;
+  }
+
+  var rawAngle = myCalfAngleFromVertical(knee.position, ankle.position);
+  var angle = myExponentialSmooth(smoothedAngleHolder, rawAngle);
+  var zoneIndex = myLegAngleToZoneIndex(angle);
+  var soundLabel = soundNames[zoneIndex];
+
+  var threshold = myLegImpactBaseThreshold / myGetSensitivityMultiplier();
+  var isImpact = myDetectImpact(impactState, angle, nowMs, threshold, myLegRefractoryMs);
+
+  textEl.textContent = sideLabel + " leg: " + angle.toFixed(1) + " deg" +
+    (isImpact ? "  HIT -> " + soundLabel : "  (would play " + soundLabel + " if hit now)");
+
+  if (isImpact) {
+    myDrawLabelAtPoint(ctx, ankle.position, soundLabel);
+    myTriggerImpactSound(soundAudio[zoneIndex]);
+  }
+}
+
+
+// =========================================================
+// HEAD - a nod (vertical bob) is the timing event; sideways tilt at that moment picks the sound.
+// Uses nose (for the nod) and left/right eye (for tilt direction) - both already provided by PoseNet.
+// =========================================================
+
+var myHeadNodBaseThreshold = 0.03; // pixels per ms (nose vertical movement)
+var myHeadRefractoryMs = 200;
+
+var myHeadSoundNames = ["snare", "clap"]; // index 0 = tilt one way, index 1 = tilt the other
+var myHeadSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/clap.wav"
+];
+var myHeadAudio = [];
+
+var myHeadImpactState = myCreateImpactState();
+var mySmoothedNoseY = { value: null };
+
+function myProcessHead(pose, nowMs, ctx) {
+  var nose = myGetKeypoint(pose, "nose");
+  var leftEye = myGetKeypoint(pose, "leftEye");
+  var rightEye = myGetKeypoint(pose, "rightEye");
+  var textEl = document.getElementById("headText");
+
+  if (!nose || !leftEye || !rightEye ||
+      nose.score < myMinKeypointScore || leftEye.score < myMinKeypointScore || rightEye.score < myMinKeypointScore) {
+    textEl.textContent = "Head: not visible";
+    mySmoothedNoseY.value = null;
+    myHeadImpactState.lastValue = null;
+    myHeadImpactState.lastTimestamp = null;
+    return;
+  }
+
+  var smoothedNoseY = myExponentialSmooth(mySmoothedNoseY, nose.position.y);
+
+  // positive = right eye lower than left eye (head tilted toward the person's actual right)
+  var tiltDiff = rightEye.position.y - leftEye.position.y;
+  var tiltIndex = tiltDiff > 0 ? 0 : 1;
+  var soundLabel = myHeadSoundNames[tiltIndex];
+
+  var threshold = myHeadNodBaseThreshold / myGetSensitivityMultiplier();
+  var isImpact = myDetectImpact(myHeadImpactState, smoothedNoseY, nowMs, threshold, myHeadRefractoryMs);
+
+  textEl.textContent = "Head: tilt " + (tiltIndex === 0 ? "actual-right" : "actual-left") +
+    (isImpact ? "  NOD -> " + soundLabel : "  (would play " + soundLabel + " if you nodded now)");
+
+  if (isImpact) {
+    myDrawLabelAtPoint(ctx, nose.position, soundLabel);
+    myTriggerImpactSound(myHeadAudio[tiltIndex]);
+  }
+}
+
+
+// =========================================================
+// JUMP - both feet leaving and returning to the ground, tracked via average hip height.
+// Single rare/big sound, matching a jump's real physical cost.
+// =========================================================
+
+var myJumpBaseThreshold = 0.1; // pixels per ms (average hip vertical movement)
+var myJumpRefractoryMs = 400;
+
+var myJumpSoundUrl = "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/boom.wav";
+var myJumpAudio = null;
+
+var myJumpImpactState = myCreateImpactState();
+var mySmoothedHipY = { value: null };
+
+function myProcessJump(pose, nowMs, ctx) {
+  var leftHip = myGetKeypoint(pose, "leftHip");
+  var rightHip = myGetKeypoint(pose, "rightHip");
+  var textEl = document.getElementById("jumpText");
+
+  if (!leftHip || !rightHip || leftHip.score < myMinKeypointScore || rightHip.score < myMinKeypointScore) {
+    textEl.textContent = "Jump: not visible";
+    mySmoothedHipY.value = null;
+    myJumpImpactState.lastValue = null;
+    myJumpImpactState.lastTimestamp = null;
+    return;
+  }
+
+  var rawHipY = (leftHip.position.y + rightHip.position.y) / 2;
+  var smoothedHipY = myExponentialSmooth(mySmoothedHipY, rawHipY);
+
+  var threshold = myJumpBaseThreshold / myGetSensitivityMultiplier();
+  var isImpact = myDetectImpact(myJumpImpactState, smoothedHipY, nowMs, threshold, myJumpRefractoryMs);
+
+  textEl.textContent = "Jump: hip height tracking" + (isImpact ? "  LANDING -> boom" : "");
+
+  if (isImpact) {
+    var midPoint = { x: (leftHip.position.x + rightHip.position.x) / 2, y: smoothedHipY };
+    myDrawLabelAtPoint(ctx, midPoint, "boom");
+    myTriggerImpactSound(myJumpAudio);
+  }
+}
+
+
+// =========================================================
+// ARMS - unchanged from v09: continuous position, scale-constrained key selection,
+// duration-by-reach. Hands are good at fine selection, so this stays position-based.
+// =========================================================
+
+var myNoteMediaFolder = "media/";
+
+var myNoteFileNames = [
+  "C.mp3", "Cs.mp3", "D.mp3", "Ds.mp3", "E.mp3", "F.mp3",
+  "Fs.mp3", "G.mp3", "Gs.mp3", "A.mp3", "As.mp3", "B.mp3",
+  "C4.mp3", "Cs4.mp3", "D4.mp3", "Ds4.mp3", "E4.mp3", "F4.mp3",
+  "Fs4.mp3", "G4.mp3", "Gs4.mp3", "A4.mp3", "As4.mp3", "B4.mp3"
+];
+
+var myNoteDisplayNames = [
+  "C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B",
+  "C4", "Cs4", "D4", "Ds4", "E4", "F4", "Fs4", "G4", "Gs4", "A4", "As4", "B4"
+];
+
+var myTotalNotes = myNoteFileNames.length; // 24
+
+var myMajorSteps = [2, 2, 1, 2, 2, 2, 1];
+var myChromaticSteps = [1,1,1,1,1,1,1,1,1,1,1,1];
+
+var myKeyList = [
+  { label: "C Major",  root: 0,  steps: myMajorSteps },
+  { label: "Cs Major", root: 1,  steps: myMajorSteps },
+  { label: "D Major",  root: 2,  steps: myMajorSteps },
+  { label: "Ds Major", root: 3,  steps: myMajorSteps },
+  { label: "E Major",  root: 4,  steps: myMajorSteps },
+  { label: "F Major",  root: 5,  steps: myMajorSteps },
+  { label: "Fs Major", root: 6,  steps: myMajorSteps },
+  { label: "G Major",  root: 7,  steps: myMajorSteps },
+  { label: "Gs Major", root: 8,  steps: myMajorSteps },
+  { label: "A Major",  root: 9,  steps: myMajorSteps },
+  { label: "As Major", root: 10, steps: myMajorSteps },
+  { label: "B Major",  root: 11, steps: myMajorSteps },
+  { label: "Chromatic (all 12 notes)", root: 0, steps: myChromaticSteps }
+];
+
+function myComputeInScale12(rootSemitone, stepsPattern) {
+  var inScale = [false, false, false, false, false, false, false, false, false, false, false, false];
+  var current = rootSemitone % 12;
+  for (var i = 0; i < stepsPattern.length; i++) {
+    inScale[current] = true;
+    current = (current + stepsPattern[i]) % 12;
+  }
+  return inScale;
+}
+
+function myBuildOwnerArray24(inScale12) {
+  var inScale24 = inScale12.concat(inScale12);
+  var n = 24;
+  var owner = new Array(n);
+  var lastInScale = -1;
+  for (var k = n - 1; k >= 0; k--) {
+    if (inScale24[k]) { lastInScale = k; break; }
+  }
+  for (var s = 0; s < n; s++) {
+    if (inScale24[s]) lastInScale = s;
+    owner[s] = lastInScale;
+  }
+  return owner;
+}
+
+var myZoneStartDegrees = [];
+var myZoneNoteIndex = [];
+
+function myRebuildNoteZones() {
+  var selectedIndex = parseInt(document.getElementById("keySelect").value, 10);
+  var selectedKey = myKeyList[selectedIndex];
+  var inScale12 = myComputeInScale12(selectedKey.root, selectedKey.steps);
+  var owner24 = myBuildOwnerArray24(inScale12);
+
+  myZoneStartDegrees = [];
+  myZoneNoteIndex = [];
+
+  var s = 0;
+  while (s < 24) {
+    var ownerSlot = owner24[s];
+    var zoneStartDegree = s * 15;
+    myZoneStartDegrees.push(zoneStartDegree);
+    myZoneNoteIndex.push(ownerSlot);
+    while (s < 24 && owner24[s] === ownerSlot) { s++; }
+  }
+
+  myUpdateKeyInfoText(selectedKey.label);
+}
+
+function myUpdateKeyInfoText(keyLabel) {
+  var parts = [];
+  for (var i = 0; i < myZoneStartDegrees.length; i++) {
+    var startDeg = myZoneStartDegrees[i];
+    var endDeg = (i + 1 < myZoneStartDegrees.length) ? myZoneStartDegrees[i + 1] : 360;
+    var noteLabel = myNoteDisplayNames[myZoneNoteIndex[i]];
+    parts.push(startDeg + "-" + endDeg + "=" + noteLabel);
+  }
+  document.getElementById("keyInfoText").textContent = keyLabel + " zones: " + parts.join(", ");
+}
+
+function myArmAngleToNoteIndex(angle) {
+  for (var i = myZoneStartDegrees.length - 1; i >= 0; i--) {
+    if (angle >= myZoneStartDegrees[i]) return myZoneNoteIndex[i];
+  }
+  return myZoneNoteIndex[0];
+}
+
+var myStraightArmMinDegrees = 150;
+
+var myMinNoteDurationMs = 150;
+var myMaxNoteDurationMs = 1200;
+var myNoteFadeOutMs = 80;
+var myReachRatioFloor = 0.9;
+
+function myDistance(a, b) {
+  var dx = a.x - b.x;
+  var dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function myComputeReachRatio(shoulder, elbow, wrist) {
+  var maxReach = myDistance(shoulder, elbow) + myDistance(elbow, wrist);
+  if (maxReach === 0) return 0;
+  var actualReach = myDistance(shoulder, wrist);
+  return Math.max(0, Math.min(1, actualReach / maxReach));
+}
+
+function myReachRatioToDurationMs(reachRatio) {
+  var durationRatio = (reachRatio - myReachRatioFloor) / (1 - myReachRatioFloor);
+  durationRatio = Math.max(0, Math.min(1, durationRatio));
+  return myMinNoteDurationMs + durationRatio * (myMaxNoteDurationMs - myMinNoteDurationMs);
+}
+
+var myNoteAudio = [];
+
+function myPreloadNoteSounds() {
+  for (var i = 0; i < myTotalNotes; i++) {
+    var url = myNoteMediaFolder + myNoteFileNames[i];
+    var a = new Audio(url);
+    a.preload = "auto";
+    myNoteAudio.push(a);
+  }
+}
+
+function myPlayNote(noteIndex, requestedDurationMs) {
+  var originalEl = myNoteAudio[noteIndex];
+  var clip = originalEl.cloneNode();
+  clip.volume = 1.0;
+  clip.play();
+
+  var naturalDurationMs = (!isNaN(originalEl.duration) && originalEl.duration > 0)
+    ? originalEl.duration * 1000
+    : requestedDurationMs;
+
+  var effectiveDurationMs = Math.min(requestedDurationMs, naturalDurationMs);
+
+  if (effectiveDurationMs < naturalDurationMs - 10) {
+    var fadeStartDelay = Math.max(0, effectiveDurationMs - myNoteFadeOutMs);
+    setTimeout(function () {
+      myFadeOutAndStop(clip, myNoteFadeOutMs);
+    }, fadeStartDelay);
+  }
+}
+
+function myFadeOutAndStop(audioEl, fadeMs) {
+  var steps = 8;
+  var stepMs = fadeMs / steps;
+  var stepAmount = 1.0 / steps;
+  var currentStep = 0;
+  var fadeTimer = setInterval(function () {
+    currentStep++;
+    audioEl.volume = Math.max(0, 1.0 - stepAmount * currentStep);
+    if (currentStep >= steps) {
+      clearInterval(fadeTimer);
+      audioEl.pause();
+    }
+  }, stepMs);
+}
+
+function myElbowStraightnessDegrees(shoulder, elbow, wrist) {
+  var v1x = shoulder.x - elbow.x;
+  var v1y = shoulder.y - elbow.y;
+  var v2x = wrist.x - elbow.x;
+  var v2y = wrist.y - elbow.y;
+
+  var dot = v1x * v2x + v1y * v2y;
+  var mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
+  var mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
+
+  if (mag1 === 0 || mag2 === 0) return 0;
+
+  var cosAngle = dot / (mag1 * mag2);
+  cosAngle = Math.max(-1, Math.min(1, cosAngle));
+  var radians = Math.acos(cosAngle);
+  return radians * 180 / Math.PI;
+}
+
+function myArmAngleFromVerticalTowardActualRight(shoulder, wrist) {
+  var dx = wrist.x - shoulder.x;
+  var dy = wrist.y - shoulder.y;
+  var radians = Math.atan2(-dx, -dy);
+  var degrees = radians * 180 / Math.PI;
+  if (degrees < 0) degrees += 360;
+  return degrees;
+}
+
+function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, currentNoteHolder, currentDurationHolder, smoothedAngleHolder, ctx) {
+  var shoulder = myGetKeypoint(pose, shoulderName);
+  var elbow = myGetKeypoint(pose, elbowName);
+  var wrist = myGetKeypoint(pose, wristName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftArmText" : "rightArmText");
+
+  if (!shoulder || !elbow || !wrist ||
+      shoulder.score < myMinKeypointScore ||
+      elbow.score < myMinKeypointScore ||
+      wrist.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " arm: not visible";
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
+    return;
+  }
+
+  var straightness = myElbowStraightnessDegrees(shoulder.position, elbow.position, wrist.position);
+  var isOut = straightness >= myStraightArmMinDegrees;
+
+  if (!isOut) {
+    textEl.textContent = sideLabel + " arm: folded (elbow " + straightness.toFixed(0) + " deg) - silent";
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
+    return;
+  }
+
+  var rawAngle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
+  var angle = myExponentialSmooth(smoothedAngleHolder, rawAngle);
+  var noteIndex = myArmAngleToNoteIndex(angle);
+  var reachRatio = myComputeReachRatio(shoulder.position, elbow.position, wrist.position);
+  var durationMs = myReachRatioToDurationMs(reachRatio);
+
+  textEl.textContent = sideLabel + " arm: " + angle.toFixed(1) + " deg  -> " + myNoteDisplayNames[noteIndex] +
+    "  (reach " + (reachRatio * 100).toFixed(0) + "%, " + durationMs.toFixed(0) + " ms)";
+
+  myDrawLabelAtPoint(ctx, wrist.position, myNoteDisplayNames[noteIndex]);
+
+  currentNoteHolder.value = noteIndex;
+  currentDurationHolder.value = durationMs;
+}
+
+var myLeftArmCurrentNote = { value: -1 };
+var myRightArmCurrentNote = { value: -1 };
+var myLeftArmCurrentDuration = { value: 0 };
+var myRightArmCurrentDuration = { value: 0 };
+var myLeftArmSmoothedAngle = { value: null };
+var myRightArmSmoothedAngle = { value: null };
+var myLeftArmLastTickNote = -1;
+var myRightArmLastTickNote = -1;
+
+
+// =========================================================
+// TEMPO CLOCK - only arms (continuous, held-note logic) and quantized impact sounds
+// (when "snap to grid" is on) go through here now. Legs/head/jump play immediately by
+// default since they are already discrete events, not continuous states to re-sample.
+// =========================================================
+
+var myClockIntervalHandle = null;
+
+function myComputeTickIntervalMs() {
+  var bpm = parseFloat(document.getElementById("bpmInput").value) || 120;
+  var subdivision = parseFloat(document.getElementById("subdivisionSelect").value) || 2;
+  var beatMs = 60000 / bpm;
+  return beatMs / subdivision;
+}
+
+function myOnClockTick() {
+  // ARMS: only re-trigger if the note actually changed since the last tick
+  if (myLeftArmCurrentNote.value >= 0 && myLeftArmCurrentNote.value !== myLeftArmLastTickNote) {
+    myPlayNote(myLeftArmCurrentNote.value, myLeftArmCurrentDuration.value);
+  }
+  myLeftArmLastTickNote = myLeftArmCurrentNote.value;
+
+  if (myRightArmCurrentNote.value >= 0 && myRightArmCurrentNote.value !== myRightArmLastTickNote) {
+    myPlayNote(myRightArmCurrentNote.value, myRightArmCurrentDuration.value);
+  }
+  myRightArmLastTickNote = myRightArmCurrentNote.value;
+
+  // impact sounds queued by "snap to grid" mode fire here, on the beat
+  for (var i = 0; i < myPendingImpactSounds.length; i++) {
+    var clip = myPendingImpactSounds[i].cloneNode();
+    clip.play();
+  }
+  myPendingImpactSounds = [];
+}
+
+function myRestartClock() {
+  if (myClockIntervalHandle !== null) {
+    clearInterval(myClockIntervalHandle);
+  }
+  myClockIntervalHandle = setInterval(myOnClockTick, myComputeTickIntervalMs());
+}
+
+document.getElementById("bpmInput").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock();
+});
+document.getElementById("subdivisionSelect").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock();
+});
+
+
+// =========================================================
+// Shared camera + main loop
+// =========================================================
+
+function myPreloadAllPercussionSounds() {
+  for (var i = 0; i < myLeftLegSoundUrls.length; i++) {
+    var a = new Audio(myLeftLegSoundUrls[i]);
+    a.preload = "auto";
+    myLeftLegAudio.push(a);
+  }
+  for (var j = 0; j < myRightLegSoundUrls.length; j++) {
+    var b = new Audio(myRightLegSoundUrls[j]);
+    b.preload = "auto";
+    myRightLegAudio.push(b);
+  }
+  for (var k = 0; k < myHeadSoundUrls.length; k++) {
+    var c = new Audio(myHeadSoundUrls[k]);
+    c.preload = "auto";
+    myHeadAudio.push(c);
+  }
+  myJumpAudio = new Audio(myJumpSoundUrl);
+  myJumpAudio.preload = "auto";
+}
+
+async function mySetupCamera() {
+  var video = document.getElementById("video");
+  var stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 480, height: 360 },
+    audio: false
+  });
+  video.srcObject = stream;
+  return new Promise(function (resolve) {
+    video.onloadedmetadata = function () {
+      resolve(video);
+    };
+  });
+}
+
+async function myDetectLoop(video, net, canvas, ctx) {
+  var pose = await net.estimateSinglePose(video, { flipHorizontal: false });
+  var nowMs = performance.now();
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  myProcessLeg(pose, "leftKnee", "leftAnkle", "left", myLeftLegImpactState, myLeftLegSmoothedAngle, myLeftLegSoundNames, myLeftLegAudio, nowMs, ctx);
+  myProcessLeg(pose, "rightKnee", "rightAnkle", "right", myRightLegImpactState, myRightLegSmoothedAngle, myRightLegSoundNames, myRightLegAudio, nowMs, ctx);
+
+  myProcessHead(pose, nowMs, ctx);
+  myProcessJump(pose, nowMs, ctx);
+
+  myProcessArm(pose, "leftShoulder", "leftElbow", "leftWrist", "left", myLeftArmCurrentNote, myLeftArmCurrentDuration, myLeftArmSmoothedAngle, ctx);
+  myProcessArm(pose, "rightShoulder", "rightElbow", "rightWrist", "right", myRightArmCurrentNote, myRightArmCurrentDuration, myRightArmSmoothedAngle, ctx);
+
+  requestAnimationFrame(function () {
+    myDetectLoop(video, net, canvas, ctx);
+  });
+}
+
+async function myMain() {
+  document.getElementById("statusText").textContent = "Loading PoseNet model...";
+  myPreloadAllPercussionSounds();
+  myPreloadNoteSounds();
+
+  var video = await mySetupCamera();
+  video.play();
+
+  var net = await posenet.load();
+
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("2d");
+
+  document.getElementById("statusText").textContent = "Running. Legs/head/jump = motion-triggered drums, arms = notes.";
+
+  myRestartClock();
+  myDetectLoop(video, net, canvas, ctx);
+}
+
+document.getElementById("keySelect").addEventListener("change", myRebuildNoteZones);
+myRebuildNoteZones();
+
+document.getElementById("startButton").addEventListener("click", function () {
+  document.getElementById("startButton").disabled = true;
+  myMain();
+});
+
+</script>
+</body>
+</html>
