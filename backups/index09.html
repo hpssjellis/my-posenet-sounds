@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseNet Legs Drums + Arms Notes v09</title>
+</head>
+<body>
+
+<p>Jeremy Ellis / webmcu-ai test v09: sounds now fire on a steady tempo clock instead of the instant
+a position changes. Your body position still decides WHAT plays (fully continuous, unchanged), but
+WHEN it plays is now locked to the beat below. Legs replay their current drum every tick while held
+in a zone (like a drum machine). Arms only re-trigger on a tick if the note actually changed since
+the last tick (so a held note doesn't machine-gun-repeat). Angle readings are also lightly smoothed
+now, which should reduce one leg falsely triggering from the other leg's movement.</p>
+
+<label for="bpmInput">Tempo (BPM): </label>
+<input type="number" id="bpmInput" value="120" min="40" max="240" step="1">
+&nbsp;&nbsp;
+<label for="subdivisionSelect">Beat subdivision: </label>
+<select id="subdivisionSelect">
+  <option value="1">Quarter notes (1 per beat)</option>
+  <option value="2" selected>Eighth notes (2 per beat)</option>
+  <option value="4">Sixteenth notes (4 per beat)</option>
+</select>
+<br><br>
+
+<label for="keySelect">Arm note key/scale: </label>
+<select id="keySelect">
+  <option value="0" selected>C Major</option>
+  <option value="1">C# Major</option>
+  <option value="2">D Major</option>
+  <option value="3">D# Major</option>
+  <option value="4">E Major</option>
+  <option value="5">F Major</option>
+  <option value="6">F# Major</option>
+  <option value="7">G Major</option>
+  <option value="8">G# Major</option>
+  <option value="9">A Major</option>
+  <option value="10">A# Major</option>
+  <option value="11">B Major</option>
+  <option value="12">Chromatic (all 12 notes)</option>
+</select>
+
+<p>
+LEGS - calf angle from vertical. Each 7 degree band = 5 degrees active (drum plays) + 2 degrees
+silent gap before the next drum's zone starts:<br>
+LEFT: 0-7 silence, then clap, boom, kick, openhat, snare (each with a gap before the next)<br>
+RIGHT: 0-7 silence, then snare, ride, tom, tink, hihat (each with a gap before the next)
+</p>
+
+<p>
+ARMS - fold across chest = silence, no other silence/gaps once extended - every angle plays some
+note. 0 degrees (straight up) is always the physical note C. The dropdown above only changes which
+notes are available and how much angular room each one gets - it does NOT move where C sits.
+</p>
+<p id="keyInfoText">(key zone info will appear here once loaded)</p>
+
+<button id="startButton">Start Camera + Sound</button>
+<br><br>
+
+<video id="video" width="480" height="360" autoplay playsinline muted style="display:none"></video>
+<canvas id="canvas" width="480" height="360"></canvas>
+
+<p id="statusText">Not started</p>
+<p id="leftLegText">Left calf angle: -</p>
+<p id="rightLegText">Right calf angle: -</p>
+<p id="leftArmText">Left arm: -</p>
+<p id="rightArmText">Right arm: -</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script>
+
+<script>
+
+var myMinKeypointScore = 0.5; // was 0.4 - slightly stricter, rejects more low-confidence noisy detections
+
+function myGetKeypoint(pose, name) {
+  for (var i = 0; i < pose.keypoints.length; i++) {
+    if (pose.keypoints[i].part === name) return pose.keypoints[i];
+  }
+  return null;
+}
+
+// simple exponential moving average, smooths frame-to-frame jitter in an angle reading.
+// holder is a {value: null} object that persists between calls for one specific limb.
+var myAngleSmoothingAlpha = 0.35; // lower = smoother/slower, higher = snappier/less smoothing
+function mySmoothAngle(holder, rawAngle) {
+  if (holder.value === null) {
+    holder.value = rawAngle;
+  } else {
+    holder.value = myAngleSmoothingAlpha * rawAngle + (1 - myAngleSmoothingAlpha) * holder.value;
+  }
+  return holder.value;
+}
+
+// draws a LARGE text label right at a keypoint so it's easy to read from a normal viewing distance
+function myDrawLabelAtPoint(ctx, point, text) {
+  ctx.font = "bold 28px sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, point.x + 10, point.y - 10);
+  ctx.fillStyle = "#000000";
+  ctx.fillText(text, point.x + 8, point.y - 12);
+}
+
+
+// =========================================================
+// LEGS - drum sounds (unchanged from v06)
+// =========================================================
+
+var myLegActiveDegrees = 5;
+var myLegDeadDegrees = 2;
+var myLegBandWidth = myLegActiveDegrees + myLegDeadDegrees;
+
+function myLegAngleToBand(angle) {
+  if (angle < myLegBandWidth) return 0;
+  var shifted = angle - myLegBandWidth;
+  var band = Math.floor(shifted / myLegBandWidth) + 1;
+  if (band >= 5) return 5;
+  var positionInBand = shifted % myLegBandWidth;
+  return positionInBand < myLegActiveDegrees ? band : 0;
+}
+
+var myLeftLegSoundNames = ["clap", "boom", "kick", "openhat", "snare"];
+var myLeftLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/clap.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/boom.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/kick.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/openhat.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav"
+];
+
+var myRightLegSoundNames = ["snare", "ride", "tom", "tink", "hihat"];
+var myRightLegSoundUrls = [
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/ride.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tom.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tink.wav",
+  "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/hihat.wav"
+];
+
+var myLeftLegAudio = [];
+var myRightLegAudio = [];
+
+function myPreloadLegSounds() {
+  for (var i = 0; i < myLeftLegSoundUrls.length; i++) {
+    var a = new Audio(myLeftLegSoundUrls[i]);
+    a.preload = "auto";
+    myLeftLegAudio.push(a);
+  }
+  for (var j = 0; j < myRightLegSoundUrls.length; j++) {
+    var b = new Audio(myRightLegSoundUrls[j]);
+    b.preload = "auto";
+    myRightLegAudio.push(b);
+  }
+}
+
+function myPlayLegSound(bandIndex, preloadedArray) {
+  var soundIndex = bandIndex - 1;
+  if (soundIndex >= preloadedArray.length) {
+    soundIndex = preloadedArray.length - 1;
+  }
+  var clip = preloadedArray[soundIndex].cloneNode();
+  clip.play();
+}
+
+function myCalfAngleFromVertical(knee, ankle) {
+  var dx = ankle.x - knee.x;
+  var dy = ankle.y - knee.y;
+  var radians = Math.atan2(dx, dy);
+  return Math.abs(radians * 180 / Math.PI);
+}
+
+function myProcessLeg(pose, kneeName, ankleName, sideLabel, currentBandHolder, smoothedAngleHolder, nameArray, ctx) {
+  var knee = myGetKeypoint(pose, kneeName);
+  var ankle = myGetKeypoint(pose, ankleName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftLegText" : "rightLegText");
+
+  if (!knee || !ankle || knee.score < myMinKeypointScore || ankle.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " calf angle: not visible";
+    currentBandHolder.value = 0;
+    smoothedAngleHolder.value = null; // reset smoothing so it doesn't jump when it reappears
+    return;
+  }
+
+  var rawAngle = myCalfAngleFromVertical(knee.position, ankle.position);
+  var angle = mySmoothAngle(smoothedAngleHolder, rawAngle);
+  var band = myLegAngleToBand(angle);
+
+  var drumLabel = "silent";
+  if (band > 0) {
+    var soundIndex = Math.min(band - 1, nameArray.length - 1);
+    drumLabel = nameArray[soundIndex];
+  }
+
+  textEl.textContent = sideLabel + " calf angle: " + angle.toFixed(1) + " deg  (band " + band + ", " + drumLabel + ")";
+
+  if (band > 0) {
+    myDrawLabelAtPoint(ctx, ankle.position, drumLabel);
+  }
+
+  currentBandHolder.value = band; // the clock tick reads this - no direct playback here anymore
+}
+
+var myLeftLegCurrentBand = { value: 0 };
+var myRightLegCurrentBand = { value: 0 };
+var myLeftLegSmoothedAngle = { value: null };
+var myRightLegSmoothedAngle = { value: null };
+
+
+// =========================================================
+// ARMS - real note mp3s, now with scale-constrained key selection
+// =========================================================
+
+// CHANGE THIS if your media folder has a different relative path/name
+var myNoteMediaFolder = "media/";
+
+// index 0-23 here is the single source of truth: 0=C ... 11=B (mid octave), 12=C4 ... 23=B4 (high octave)
+var myNoteFileNames = [
+  "C.mp3", "Cs.mp3", "D.mp3", "Ds.mp3", "E.mp3", "F.mp3",
+  "Fs.mp3", "G.mp3", "Gs.mp3", "A.mp3", "As.mp3", "B.mp3",
+  "C4.mp3", "Cs4.mp3", "D4.mp3", "Ds4.mp3", "E4.mp3", "F4.mp3",
+  "Fs4.mp3", "G4.mp3", "Gs4.mp3", "A4.mp3", "As4.mp3", "B4.mp3"
+];
+
+var myNoteDisplayNames = [
+  "C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B",
+  "C4", "Cs4", "D4", "Ds4", "E4", "F4", "Fs4", "G4", "Gs4", "A4", "As4", "B4"
+];
+
+var myTotalNotes = myNoteFileNames.length; // 24
+
+var myMajorSteps = [2, 2, 1, 2, 2, 2, 1];      // whole/whole/half/whole/whole/whole/half
+var myChromaticSteps = [1,1,1,1,1,1,1,1,1,1,1,1]; // all 12 semitones, no scale restriction
+
+var myKeyList = [
+  { label: "C Major",  root: 0,  steps: myMajorSteps },
+  { label: "Cs Major", root: 1,  steps: myMajorSteps },
+  { label: "D Major",  root: 2,  steps: myMajorSteps },
+  { label: "Ds Major", root: 3,  steps: myMajorSteps },
+  { label: "E Major",  root: 4,  steps: myMajorSteps },
+  { label: "F Major",  root: 5,  steps: myMajorSteps },
+  { label: "Fs Major", root: 6,  steps: myMajorSteps },
+  { label: "G Major",  root: 7,  steps: myMajorSteps },
+  { label: "Gs Major", root: 8,  steps: myMajorSteps },
+  { label: "A Major",  root: 9,  steps: myMajorSteps },
+  { label: "As Major", root: 10, steps: myMajorSteps },
+  { label: "B Major",  root: 11, steps: myMajorSteps },
+  { label: "Chromatic (all 12 notes)", root: 0, steps: myChromaticSteps }
+];
+
+// which of the 12 semitones (0=C ... 11=B) belong to this key
+function myComputeInScale12(rootSemitone, stepsPattern) {
+  var inScale = [false, false, false, false, false, false, false, false, false, false, false, false];
+  var current = rootSemitone % 12;
+  for (var i = 0; i < stepsPattern.length; i++) {
+    inScale[current] = true;
+    current = (current + stepsPattern[i]) % 12;
+  }
+  return inScale;
+}
+
+// each of the 24 semitone slots (2 octaves) gets "assigned" to the nearest in-scale semitone
+// at or before it, wrapping circularly across the full 360 degree / 24 slot range. Out-of-scale
+// semitones end up with zero width - fully absorbed into the note before them.
+function myBuildOwnerArray24(inScale12) {
+  var inScale24 = inScale12.concat(inScale12); // same pattern in both octaves
+  var n = 24;
+  var owner = new Array(n);
+  var lastInScale = -1;
+  for (var k = n - 1; k >= 0; k--) {
+    if (inScale24[k]) { lastInScale = k; break; }
+  }
+  for (var s = 0; s < n; s++) {
+    if (inScale24[s]) lastInScale = s;
+    owner[s] = lastInScale;
+  }
+  return owner;
+}
+
+var myZoneStartDegrees = []; // cumulative degree boundaries, ascending
+var myZoneNoteIndex = [];    // matching note index (0-23) for each zone
+
+function myRebuildNoteZones() {
+  var selectedIndex = parseInt(document.getElementById("keySelect").value, 10);
+  var selectedKey = myKeyList[selectedIndex];
+  var inScale12 = myComputeInScale12(selectedKey.root, selectedKey.steps);
+  var owner24 = myBuildOwnerArray24(inScale12);
+
+  myZoneStartDegrees = [];
+  myZoneNoteIndex = [];
+
+  var s = 0;
+  while (s < 24) {
+    var ownerSlot = owner24[s];
+    var zoneStartDegree = s * 15;
+    myZoneStartDegrees.push(zoneStartDegree);
+    myZoneNoteIndex.push(ownerSlot);
+    while (s < 24 && owner24[s] === ownerSlot) { s++; }
+  }
+
+  myUpdateKeyInfoText(selectedKey.label);
+}
+
+function myUpdateKeyInfoText(keyLabel) {
+  var parts = [];
+  for (var i = 0; i < myZoneStartDegrees.length; i++) {
+    var startDeg = myZoneStartDegrees[i];
+    var endDeg = (i + 1 < myZoneStartDegrees.length) ? myZoneStartDegrees[i + 1] : 360;
+    var noteLabel = myNoteDisplayNames[myZoneNoteIndex[i]];
+    parts.push(startDeg + "-" + endDeg + "=" + noteLabel);
+  }
+  document.getElementById("keyInfoText").textContent = keyLabel + " zones: " + parts.join(", ");
+}
+
+function myArmAngleToNoteIndex(angle) {
+  for (var i = myZoneStartDegrees.length - 1; i >= 0; i--) {
+    if (angle >= myZoneStartDegrees[i]) return myZoneNoteIndex[i];
+  }
+  return myZoneNoteIndex[0];
+}
+
+var myStraightArmMinDegrees = 150;
+
+// ---- note duration controlled by how far the hand reaches from the shoulder ----
+var myMinNoteDurationMs = 150;   // shortest sustain, for a reach right at the straightness threshold
+var myMaxNoteDurationMs = 1200;  // longest sustain, capped by the clip's own natural length anyway
+var myNoteFadeOutMs = 80;        // short fade before an early cutoff, so it doesn't click
+
+// Geometry note: since the elbow-straightness gate already requires a near-straight arm (150-180 deg),
+// the physically possible reach ratio only varies over a narrow band up near 1.0 while the arm counts
+// as "out". myReachRatioFloor stretches that narrow real-world band across the full duration range,
+// otherwise the duration effect would be barely noticeable.
+var myReachRatioFloor = 0.9;
+
+function myDistance(a, b) {
+  var dx = a.x - b.x;
+  var dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// 0 = hand at the shoulder, 1 = arm fully straight and extended (chord length can never exceed
+// the sum of the two arm segments, so this naturally stays in the 0-1 range)
+function myComputeReachRatio(shoulder, elbow, wrist) {
+  var maxReach = myDistance(shoulder, elbow) + myDistance(elbow, wrist);
+  if (maxReach === 0) return 0;
+  var actualReach = myDistance(shoulder, wrist);
+  return Math.max(0, Math.min(1, actualReach / maxReach));
+}
+
+function myReachRatioToDurationMs(reachRatio) {
+  var durationRatio = (reachRatio - myReachRatioFloor) / (1 - myReachRatioFloor);
+  durationRatio = Math.max(0, Math.min(1, durationRatio));
+  return myMinNoteDurationMs + durationRatio * (myMaxNoteDurationMs - myMinNoteDurationMs);
+}
+
+var myNoteAudio = [];
+
+function myPreloadNoteSounds() {
+  for (var i = 0; i < myTotalNotes; i++) {
+    var url = myNoteMediaFolder + myNoteFileNames[i];
+    var a = new Audio(url);
+    a.preload = "auto";
+    myNoteAudio.push(a);
+  }
+}
+
+function myPlayNote(noteIndex, requestedDurationMs) {
+  var originalEl = myNoteAudio[noteIndex];
+  var clip = originalEl.cloneNode();
+  clip.volume = 1.0;
+  clip.play();
+
+  // cap the requested duration at the clip's own natural length - we can only ever cut a
+  // sample SHORT, we can't make it play longer than the audio that actually exists
+  var naturalDurationMs = (!isNaN(originalEl.duration) && originalEl.duration > 0)
+    ? originalEl.duration * 1000
+    : requestedDurationMs;
+
+  var effectiveDurationMs = Math.min(requestedDurationMs, naturalDurationMs);
+
+  // only schedule an early cutoff if we're actually cutting it meaningfully short;
+  // otherwise just let the clip play out naturally to its own end
+  if (effectiveDurationMs < naturalDurationMs - 10) {
+    var fadeStartDelay = Math.max(0, effectiveDurationMs - myNoteFadeOutMs);
+    setTimeout(function () {
+      myFadeOutAndStop(clip, myNoteFadeOutMs);
+    }, fadeStartDelay);
+  }
+}
+
+function myFadeOutAndStop(audioEl, fadeMs) {
+  var steps = 8;
+  var stepMs = fadeMs / steps;
+  var stepAmount = 1.0 / steps;
+  var currentStep = 0;
+  var fadeTimer = setInterval(function () {
+    currentStep++;
+    audioEl.volume = Math.max(0, 1.0 - stepAmount * currentStep);
+    if (currentStep >= steps) {
+      clearInterval(fadeTimer);
+      audioEl.pause();
+    }
+  }, stepMs);
+}
+
+function myElbowStraightnessDegrees(shoulder, elbow, wrist) {
+  var v1x = shoulder.x - elbow.x;
+  var v1y = shoulder.y - elbow.y;
+  var v2x = wrist.x - elbow.x;
+  var v2y = wrist.y - elbow.y;
+
+  var dot = v1x * v2x + v1y * v2y;
+  var mag1 = Math.sqrt(v1x * v1x + v1y * v1y);
+  var mag2 = Math.sqrt(v2x * v2x + v2y * v2y);
+
+  if (mag1 === 0 || mag2 === 0) return 0;
+
+  var cosAngle = dot / (mag1 * mag2);
+  cosAngle = Math.max(-1, Math.min(1, cosAngle));
+  var radians = Math.acos(cosAngle);
+  return radians * 180 / Math.PI;
+}
+
+function myArmAngleFromVerticalTowardActualRight(shoulder, wrist) {
+  var dx = wrist.x - shoulder.x;
+  var dy = wrist.y - shoulder.y;
+  var radians = Math.atan2(-dx, -dy);
+  var degrees = radians * 180 / Math.PI;
+  if (degrees < 0) degrees += 360;
+  return degrees;
+}
+
+function myProcessArm(pose, shoulderName, elbowName, wristName, sideLabel, currentNoteHolder, currentDurationHolder, smoothedAngleHolder, ctx) {
+  var shoulder = myGetKeypoint(pose, shoulderName);
+  var elbow = myGetKeypoint(pose, elbowName);
+  var wrist = myGetKeypoint(pose, wristName);
+  var textEl = document.getElementById(sideLabel === "left" ? "leftArmText" : "rightArmText");
+
+  if (!shoulder || !elbow || !wrist ||
+      shoulder.score < myMinKeypointScore ||
+      elbow.score < myMinKeypointScore ||
+      wrist.score < myMinKeypointScore) {
+    textEl.textContent = sideLabel + " arm: not visible";
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
+    return;
+  }
+
+  var straightness = myElbowStraightnessDegrees(shoulder.position, elbow.position, wrist.position);
+  var isOut = straightness >= myStraightArmMinDegrees;
+
+  if (!isOut) {
+    textEl.textContent = sideLabel + " arm: folded (elbow " + straightness.toFixed(0) + " deg) - silent";
+    currentNoteHolder.value = -1;
+    smoothedAngleHolder.value = null;
+    return;
+  }
+
+  var rawAngle = myArmAngleFromVerticalTowardActualRight(shoulder.position, wrist.position);
+  var angle = mySmoothAngle(smoothedAngleHolder, rawAngle);
+  var noteIndex = myArmAngleToNoteIndex(angle);
+  var reachRatio = myComputeReachRatio(shoulder.position, elbow.position, wrist.position);
+  var durationMs = myReachRatioToDurationMs(reachRatio);
+
+  textEl.textContent = sideLabel + " arm: " + angle.toFixed(1) + " deg  -> " + myNoteDisplayNames[noteIndex] +
+    "  (reach " + (reachRatio * 100).toFixed(0) + "%, " + durationMs.toFixed(0) + " ms)";
+
+  myDrawLabelAtPoint(ctx, wrist.position, myNoteDisplayNames[noteIndex]);
+
+  currentNoteHolder.value = noteIndex;       // the clock tick reads these - no direct playback here anymore
+  currentDurationHolder.value = durationMs;
+}
+
+var myLeftArmCurrentNote = { value: -1 };
+var myRightArmCurrentNote = { value: -1 };
+var myLeftArmCurrentDuration = { value: 0 };
+var myRightArmCurrentDuration = { value: 0 };
+var myLeftArmSmoothedAngle = { value: null };
+var myRightArmSmoothedAngle = { value: null };
+var myLeftArmLastTickNote = -1;  // what was actually PLAYED on the previous tick (for change detection)
+var myRightArmLastTickNote = -1;
+
+
+// =========================================================
+// TEMPO CLOCK - decouples WHAT plays (continuous body position, every video frame)
+// from WHEN it plays (fixed musical grid, independent of video framerate)
+// =========================================================
+
+var myClockIntervalHandle = null;
+
+function myComputeTickIntervalMs() {
+  var bpm = parseFloat(document.getElementById("bpmInput").value) || 120;
+  var subdivision = parseFloat(document.getElementById("subdivisionSelect").value) || 2;
+  var beatMs = 60000 / bpm;
+  return beatMs / subdivision;
+}
+
+function myOnClockTick() {
+  // LEGS: replay the currently-held drum every tick, like a drum machine locked to the beat
+  if (myLeftLegCurrentBand.value > 0) {
+    myPlayLegSound(myLeftLegCurrentBand.value, myLeftLegAudio);
+  }
+  if (myRightLegCurrentBand.value > 0) {
+    myPlayLegSound(myRightLegCurrentBand.value, myRightLegAudio);
+  }
+
+  // ARMS: only re-trigger if the note actually changed since the last tick,
+  // so a held note doesn't machine-gun-repeat every subdivision
+  if (myLeftArmCurrentNote.value >= 0 && myLeftArmCurrentNote.value !== myLeftArmLastTickNote) {
+    myPlayNote(myLeftArmCurrentNote.value, myLeftArmCurrentDuration.value);
+  }
+  myLeftArmLastTickNote = myLeftArmCurrentNote.value;
+
+  if (myRightArmCurrentNote.value >= 0 && myRightArmCurrentNote.value !== myRightArmLastTickNote) {
+    myPlayNote(myRightArmCurrentNote.value, myRightArmCurrentDuration.value);
+  }
+  myRightArmLastTickNote = myRightArmCurrentNote.value;
+}
+
+function myRestartClock() {
+  if (myClockIntervalHandle !== null) {
+    clearInterval(myClockIntervalHandle);
+  }
+  myClockIntervalHandle = setInterval(myOnClockTick, myComputeTickIntervalMs());
+}
+
+document.getElementById("bpmInput").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock(); // only live-update if already running
+});
+document.getElementById("subdivisionSelect").addEventListener("change", function () {
+  if (myClockIntervalHandle !== null) myRestartClock();
+});
+
+
+// =========================================================
+// Shared camera + main loop
+// =========================================================
+
+async function mySetupCamera() {
+  var video = document.getElementById("video");
+  var stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 480, height: 360 },
+    audio: false
+  });
+  video.srcObject = stream;
+  return new Promise(function (resolve) {
+    video.onloadedmetadata = function () {
+      resolve(video);
+    };
+  });
+}
+
+async function myDetectLoop(video, net, canvas, ctx) {
+  var pose = await net.estimateSinglePose(video, { flipHorizontal: false });
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  // skeleton dots removed - the note/drum labels are the useful visual now
+
+  myProcessLeg(pose, "leftKnee", "leftAnkle", "left", myLeftLegCurrentBand, myLeftLegSmoothedAngle, myLeftLegSoundNames, ctx);
+  myProcessLeg(pose, "rightKnee", "rightAnkle", "right", myRightLegCurrentBand, myRightLegSmoothedAngle, myRightLegSoundNames, ctx);
+
+  myProcessArm(pose, "leftShoulder", "leftElbow", "leftWrist", "left", myLeftArmCurrentNote, myLeftArmCurrentDuration, myLeftArmSmoothedAngle, ctx);
+  myProcessArm(pose, "rightShoulder", "rightElbow", "rightWrist", "right", myRightArmCurrentNote, myRightArmCurrentDuration, myRightArmSmoothedAngle, ctx);
+
+  requestAnimationFrame(function () {
+    myDetectLoop(video, net, canvas, ctx);
+  });
+}
+
+async function myMain() {
+  document.getElementById("statusText").textContent = "Loading PoseNet model...";
+  myPreloadLegSounds();
+  myPreloadNoteSounds();
+
+  var video = await mySetupCamera();
+  video.play();
+
+  var net = await posenet.load();
+
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("2d");
+
+  document.getElementById("statusText").textContent = "Running. Legs = drums, arms = notes, tempo clock is live.";
+
+  myRestartClock();
+  myDetectLoop(video, net, canvas, ctx);
+}
+
+document.getElementById("keySelect").addEventListener("change", myRebuildNoteZones);
+myRebuildNoteZones(); // build the default C Major zones immediately on page load
+
+document.getElementById("startButton").addEventListener("click", function () {
+  document.getElementById("startButton").disabled = true;
+  myMain();
+});
+
+</script>
+</body>
+</html>
